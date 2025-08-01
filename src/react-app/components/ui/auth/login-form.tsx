@@ -1,16 +1,17 @@
 import React from 'react';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '../button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../card';
+import { Alert, AlertDescription } from '../alert';
 import { Loader2, LogIn } from 'lucide-react';
 
 interface LoginFormProps {
   onLogin: () => Promise<void>;
   loading?: boolean;
   error?: string | null;
+  onCancel?: () => void;
 }
 
-export function LoginForm({ onLogin, loading = false, error }: LoginFormProps) {
+export function LoginForm({ onLogin, loading = false, error, onCancel }: LoginFormProps) {
   const handleGoogleLogin = async () => {
     await onLogin();
   };
@@ -50,6 +51,17 @@ export function LoginForm({ onLogin, loading = false, error }: LoginFormProps) {
             </svg>
             Sign in with Google
           </Button>
+          
+          {onCancel && (
+            <Button 
+              onClick={onCancel}
+              variant="outline"
+              className="w-full"
+              size="lg"
+            >
+              Continue as Anonymous
+            </Button>
+          )}
           
           <div className="text-center text-sm text-muted-foreground">
             Your conversations are private and securely stored in Firebase

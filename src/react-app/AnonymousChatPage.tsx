@@ -4,11 +4,22 @@ import React, { useState, useCallback, useEffect } from 'react';
 import { Chat } from '@/components/ui/chat/chat';
 import { ChatSidebar } from '@/components/ui/chat/chat-sidebar';
 import { Message } from '@/components/ui/chat/chat-message';
-import { useChatPersistence } from '@/hooks/use-chat-persistence';
 import { useAuth } from '@/hooks/use-auth';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Loader2, MessageSquare } from 'lucide-react';
+import {
+  AnonymousChat,
+  AnonymousMessage,
+  createAnonymousChat,
+  getAnonymousChats,
+  getAnonymousMessages,
+  addAnonymousMessage,
+  updateAnonymousChatTitle,
+  deleteAnonymousChat,
+  generateChatTitle,
+  getSessionId
+} from '@/lib/anonymous-chat';
 
 interface ChatMessage extends Message {
   id: string;
@@ -17,152 +28,212 @@ interface ChatMessage extends Message {
   createdAt: Date;
 }
 
-export default function PersistentChatPage() {
-  const { logout } = useAuth();
-  const {
-    chats,
-    currentChat,
-    messages: persistedMessages,
-    user,
-    loading,
-    error,
-    loadChat,
-    createNewChat,
-    sendMessage,
-    renameChat,
-    deleteChat,
-    setMessages: setPersistedMessages,
-    setError
-  } = useChatPersistence();
-
-  const [localMessages, setLocalMessages] = useState<ChatMessage[]>([]);
+export default function AnonymousChatPage() {
+  const { user } = useAuth();
+  const [chats, setChats] = useState<AnonymousChat[]>([]);
+  const [currentChat, setCurrentChat] = useState<AnonymousChat | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Convert persisted messages to local format
+  // Load chats on component mount
   useEffect(() => {
-    const converted = persistedMessages.map(msg => ({
-      id: msg.id,
-      role: msg.role,
-      content: msg.content,
-      createdAt: new Date(msg.created_at)
-    }));
-    setLocalMessages(converted);
-  }, [persistedMessages]);
+    loadChats();
+  }, []);
+
+  // Load messages when current chat changes
+  useEffect(() => {
+    if (currentChat) {
+      loadMessages(currentChat.id);
+    } else {
+      setMessages([]);
+    }
+  }, [currentChat]);
+
+  const loadChats = async () => {
+    try {
+      setLoading(true);
+      const loadedChats = await getAnonymousChats();
+      setChats(loadedChats);
+    } catch (error) {
+      console.error('Error loading chats:', error);
+      setError('Failed to load chats');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadMessages = async (chatId: string) => {
+    try {
+      const loadedMessages = await getAnonymousMessages(chatId);
+      const convertedMessages = loadedMessages.map(msg => ({
+        id: msg.id,
+        role: msg.role,
+        content: msg.content,
+        createdAt: msg.createdAt.toDate()
+      }));
+      setMessages(convertedMessages);
+    } catch (error) {
+      console.error('Error loading messages:', error);
+      setError('Failed to load messages');
+    }
+  };
 
   const handleSelectChat = useCallback(async (chatId: string) => {
-    await loadChat(chatId);
-  }, [loadChat]);
+    const chat = chats.find(c => c.id === chatId);
+    if (chat) {
+      setCurrentChat(chat);
+      setError(null);
+    }
+  }, [chats]);
 
   const handleNewChat = useCallback(async () => {
-    const newChat = await createNewChat();
-    if (newChat) {
+    try {
+      const newChat = await createAnonymousChat('New Chat');
+      setChats(prev => [newChat, ...prev]);
+      setCurrentChat(newChat);
+      setMessages([]);
       setInput('');
-      setLocalMessages([]);
+      setError(null);
+    } catch (error) {
+      console.error('Error creating new chat:', error);
+      setError('Failed to create new chat');
     }
-  }, [createNewChat]);
+  }, []);
 
   const handleDeleteChat = useCallback(async (chatId: string) => {
     if (confirm('Are you sure you want to delete this chat?')) {
-      await deleteChat(chatId);
+      try {
+        await deleteAnonymousChat(chatId);
+        setChats(prev => prev.filter(c => c.id !== chatId));
+        if (currentChat?.id === chatId) {
+          setCurrentChat(null);
+          setMessages([]);
+        }
+      } catch (error) {
+        console.error('Error deleting chat:', error);
+        setError('Failed to delete chat');
+      }
     }
-  }, [deleteChat]);
+  }, [currentChat]);
+
+  const handleRenameChat = useCallback(async (chatId: string, newTitle: string) => {
+    try {
+      await updateAnonymousChatTitle(chatId, newTitle);
+      setChats(prev => prev.map(chat => 
+        chat.id === chatId ? { ...chat, title: newTitle } : chat
+      ));
+      if (currentChat?.id === chatId) {
+        setCurrentChat(prev => prev ? { ...prev, title: newTitle } : null);
+      }
+    } catch (error) {
+      console.error('Error renaming chat:', error);
+      setError('Failed to rename chat');
+    }
+  }, [currentChat]);
 
   const sendMessageToAI = useCallback(async (messageText: string, currentMessages: ChatMessage[]) => {
-    if (!currentChat) {
-      // Create new chat if none exists
-      const newChat = await createNewChat();
-      if (!newChat) return;
-    }
-
-    const chatId = currentChat?.id;
-    if (!chatId) return;
-
-    console.log('PersistentChatPage: Starting streaming with persistence');
-
-    const response = await sendMessage(chatId, messageText, true);
-    if (!response) return;
-
-    if (!response.ok) {
-      console.error('PersistentChatPage: API response error', response.status);
-      throw new Error('Failed to get response');
-    }
-
-    console.log('PersistentChatPage: Stream response received');
-
-    // Create assistant message with typing indicator
-    const assistantMessage: ChatMessage = {
-      id: (Date.now() + 1).toString(),
-      role: 'assistant',
-      content: '',
-      createdAt: new Date(),
-    };
-
-    // Add to local messages
-    setLocalMessages(prev => [...prev, assistantMessage]);
-
-    if (!response.body) {
-      throw new Error('No response body');
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullContent = '';
-
-    // Function to remove cursor and finalize message
-    const finalizeMessage = () => {
-      setLocalMessages(prev => prev.map(msg => 
-        msg.id === assistantMessage.id 
-          ? { ...msg, content: fullContent }
-          : msg
-      ));
-    };
+    if (!currentChat) return;
 
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      // Build messages array for AI context
+      const messagesForAI = currentMessages.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      }));
 
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+      // Make API call to legacy endpoint for anonymous chats
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: messagesForAI
+        }),
+      });
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              
-              if (data.done) {
-                console.log('PersistentChatPage: Stream completed');
-                finalizeMessage();
-                return;
+      if (!response.ok) {
+        throw new Error('Failed to get response');
+      }
+
+      // Create assistant message with typing indicator
+      const assistantMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: '',
+        createdAt: new Date(),
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+
+      if (!response.body) {
+        throw new Error('No response body');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = '';
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n');
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                
+                if (data.done) {
+                  // Save final assistant message to Firestore
+                  await addAnonymousMessage(currentChat.id, 'assistant', fullContent);
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === assistantMessage.id 
+                      ? { ...msg, content: fullContent }
+                      : msg
+                  ));
+                  return;
+                }
+
+                if (data.error) {
+                  throw new Error(data.error);
+                }
+
+                if (data.content) {
+                  fullContent += data.content;
+                  setMessages(prev => prev.map(msg => 
+                    msg.id === assistantMessage.id 
+                      ? { ...msg, content: fullContent + '|' }
+                      : msg
+                  ));
+                }
+              } catch (e) {
+                console.warn('Failed to parse SSE data:', line);
               }
-
-              if (data.error) {
-                console.error('PersistentChatPage: Stream error:', data.error);
-                throw new Error(data.error);
-              }
-
-              if (data.content) {
-                fullContent += data.content;
-                setLocalMessages(prev => prev.map(msg => 
-                  msg.id === assistantMessage.id 
-                    ? { ...msg, content: fullContent + '|' }
-                    : msg
-                ));
-              }
-            } catch (e) {
-              console.warn('PersistentChatPage: Failed to parse SSE data:', line);
             }
           }
         }
+      } catch (error) {
+        console.error('Stream reading error:', error);
+        setMessages(prev => prev.map(msg => 
+          msg.id === assistantMessage.id 
+            ? { ...msg, content: fullContent }
+            : msg
+        ));
+        throw error;
       }
     } catch (error) {
-      console.error('PersistentChatPage: Stream reading error:', error);
-      finalizeMessage();
+      console.error('Error sending message to AI:', error);
       throw error;
     }
-  }, [currentChat, createNewChat, sendMessage]);
+  }, [currentChat]);
 
   const handleSendMessage = useCallback(async () => {
     if (!input.trim() || isGenerating) return;
@@ -172,13 +243,26 @@ export default function PersistentChatPage() {
     setIsGenerating(true);
     setError(null);
 
-    // If this is the first message, open sidebar
-    if (localMessages.length === 0) {
+    // If this is the first message, open sidebar and create chat if needed
+    if (messages.length === 0) {
       setSidebarOpen(true);
+      
+      if (!currentChat) {
+        try {
+          const newChat = await createAnonymousChat(generateChatTitle(messageText));
+          setChats(prev => [newChat, ...prev]);
+          setCurrentChat(newChat);
+        } catch (error) {
+          console.error('Error creating chat:', error);
+          setError('Failed to create chat');
+          setIsGenerating(false);
+          return;
+        }
+      }
     }
 
     try {
-      // Add user message to local state immediately
+      // Add user message to local state and Firestore
       const userMessage: ChatMessage = {
         id: Date.now().toString(),
         role: 'user',
@@ -186,28 +270,38 @@ export default function PersistentChatPage() {
         createdAt: new Date(),
       };
 
-      setLocalMessages(prev => [...prev, userMessage]);
+      setMessages(prev => [...prev, userMessage]);
 
-      // Send to AI
-      await sendMessageToAI(messageText, [...localMessages, userMessage]);
-
-      // Reload the chat to get the persisted messages
+      // Save user message to Firestore
       if (currentChat) {
-        await loadChat(currentChat.id);
+        await addAnonymousMessage(currentChat.id, 'user', messageText);
+        
+        // Update chat title if it's the first message
+        if (messages.length === 0) {
+          const newTitle = generateChatTitle(messageText);
+          await updateAnonymousChatTitle(currentChat.id, newTitle);
+          setChats(prev => prev.map(chat => 
+            chat.id === currentChat.id ? { ...chat, title: newTitle } : chat
+          ));
+          setCurrentChat(prev => prev ? { ...prev, title: newTitle } : null);
+        }
       }
 
+      // Send to AI
+      await sendMessageToAI(messageText, [...messages, userMessage]);
+
     } catch (error) {
-      console.error('PersistentChatPage: Error sending message:', error);
+      console.error('Error sending message:', error);
       setError(error instanceof Error ? error.message : 'Failed to send message');
     } finally {
       setIsGenerating(false);
     }
-  }, [input, isGenerating, localMessages, sendMessageToAI, currentChat, loadChat, setError]);
+  }, [input, isGenerating, messages, currentChat, sendMessageToAI]);
 
   // Show loading state
-  if (loading && !currentChat) {
+  if (loading && chats.length === 0) {
     return (
-      <div className="flex items-center justify-center h-screen">
+      <div className="flex items-center justify-center h-full">
         <div className="text-center">
           <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4" />
           <p className="text-muted-foreground">Loading your chats...</p>
@@ -216,46 +310,31 @@ export default function PersistentChatPage() {
     );
   }
 
-  // Show authentication error
-  if (error && error.includes('Authentication required')) {
-    return (
-      <div className="flex items-center justify-center h-screen p-4">
-        <div className="text-center max-w-md">
-          <MessageSquare className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-          <h2 className="text-xl font-semibold mb-2">Authentication Required</h2>
-          <p className="text-muted-foreground mb-4">
-            Please configure Cloudflare Access or set development headers to use the chat persistence features.
-          </p>
-          <Alert>
-            <AlertDescription>
-              For development, make sure the worker can read authentication headers. 
-              See DATABASE_SETUP.md for configuration instructions.
-            </AlertDescription>
-          </Alert>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="flex h-screen bg-background">
+    <div className="flex h-full bg-background">
       {sidebarOpen && (
         <ChatSidebar
-          chats={chats}
+          chats={chats.map(chat => ({
+            id: chat.id,
+            title: chat.title,
+            created_at: chat.createdAt.toDate().toISOString(),
+            updated_at: chat.updatedAt.toDate().toISOString(),
+            user_id: getSessionId()
+          }))}
           currentChatId={currentChat?.id}
-          user={user || undefined}
+          user={{ email: 'Anonymous User' }}
           onSelectChat={handleSelectChat}
           onNewChat={handleNewChat}
           onDeleteChat={handleDeleteChat}
-          onRenameChat={renameChat}
-          onLogout={logout}
+          onRenameChat={handleRenameChat}
+          onLogout={() => {}} // No logout for anonymous users
           loading={loading}
         />
       )}
       
       <div className="flex-1 flex flex-col">
         {/* Header - only show when there are messages */}
-        {localMessages.length > 0 && (
+        {messages.length > 0 && (
           <div className="border-b p-4 flex items-center justify-between">
             <div className="flex items-center space-x-2">
               <Button
@@ -277,7 +356,7 @@ export default function PersistentChatPage() {
         )}
 
         {/* Error Display */}
-        {error && !error.includes('Authentication required') && (
+        {error && (
           <div className="p-4">
             <Alert variant="destructive">
               <AlertDescription>{error}</AlertDescription>
@@ -286,10 +365,10 @@ export default function PersistentChatPage() {
         )}
 
         {/* Chat Interface */}
-        {localMessages.length > 0 ? (
+        {messages.length > 0 ? (
           <div className="flex-1">
             <Chat
-              messages={localMessages}
+              messages={messages}
               input={input}
               handleInputChange={setInput}
               handleSubmit={(e) => {
@@ -347,7 +426,7 @@ export default function PersistentChatPage() {
                   </button>
                 </div>
                 
-                {/* Optional: Add some example prompts */}
+                {/* Example prompts */}
                 <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl mx-auto">
                   <button
                     onClick={() => setInput("Explain quantum computing")}

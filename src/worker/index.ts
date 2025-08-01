@@ -261,69 +261,131 @@ app.post("/api/chat", async (c) => {
   console.log('API Route: Legacy chat endpoint - consider migrating to /api/chats/:id/messages');
   
   try {
-    const { messages } = await c.req.json();
+    const body = await c.req.json();
+    
+    if (!body.messages || !Array.isArray(body.messages)) {
+      return c.json({ error: 'Invalid request: messages array is required' }, 400);
+    }
+    
+    const { messages } = body;
     console.log('API Route: Processing conversation', { messageCount: messages.length });
 
     const apiKey = c.env?.GEMINI_API_KEY;
+    console.log('API Route: API Key check', { 
+      hasApiKey: !!apiKey, 
+      keyLength: apiKey?.length,
+      keyPrefix: apiKey?.substring(0, 10)
+    });
+    
     if (!apiKey) {
       console.error('API Route: Missing GEMINI_API_KEY');
-      return c.json({ error: 'API key not configured' }, 500);
+      return c.json({ error: 'API key not configured. Please contact support.' }, 500);
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const contents = messages.map((msg: any) => ({
-      role: msg.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: msg.content }],
-    }));
+      // Validate and convert messages
+      const contents = messages.map((msg: any, index: number) => {
+        if (!msg.role || !msg.content) {
+          throw new Error(`Invalid message at index ${index}: role and content are required`);
+        }
+        
+        return {
+          role: msg.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: String(msg.content) }],
+        };
+      });
 
-    const encoder = new TextEncoder();
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          const result = await model.generateContentStream({ contents });
+      const encoder = new TextEncoder();
+      const readable = new ReadableStream({
+        async start(controller) {
+          try {
+            const result = await model.generateContentStream({ contents });
 
-          for await (const chunk of result.stream) {
-            const chunkText = chunk.text();
-            if (chunkText) {
-              for (let i = 0; i < chunkText.length; i += 3) {
-                const miniChunk = chunkText.slice(i, i + 3);
-                const data = JSON.stringify({ content: miniChunk });
-                controller.enqueue(encoder.encode(`data: ${data}\n\n`));
-                await new Promise(resolve => setTimeout(resolve, 20));
+            for await (const chunk of result.stream) {
+              const chunkText = chunk.text();
+              if (chunkText) {
+                for (let i = 0; i < chunkText.length; i += 3) {
+                  const miniChunk = chunkText.slice(i, i + 3);
+                  const data = JSON.stringify({ content: miniChunk });
+                  controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+                  await new Promise(resolve => setTimeout(resolve, 20));
+                }
               }
             }
+
+            controller.enqueue(encoder.encode(`data: {"done": true}\n\n`));
+            controller.close();
+          } catch (error) {
+            console.error('API Route: Streaming error:', error);
+            
+            let errorMessage = 'AI service temporarily unavailable';
+            if (error instanceof Error) {
+              console.error('API Route: Detailed streaming error:', {
+                message: error.message,
+                stack: error.stack,
+                name: error.name
+              });
+              
+              if (error.message.includes('API_KEY') || error.message.includes('API key') || error.message.includes('401')) {
+                errorMessage = 'Invalid API key configuration';
+              } else if (error.message.includes('QUOTA') || error.message.includes('quota')) {
+                errorMessage = 'API quota exceeded. Please try again later';
+              } else if (error.message.includes('SAFETY')) {
+                errorMessage = 'Content policy violation. Please rephrase your message';
+              } else if (error.message.includes('BLOCKED')) {
+                errorMessage = 'Content blocked by safety filters';
+              } else if (error.message.includes('fetch') || error.message.includes('network')) {
+                errorMessage = 'Network error connecting to AI service';
+              } else {
+                errorMessage = error.message;
+              }
+            }
+            
+            const errorData = JSON.stringify({
+              error: errorMessage
+            });
+            controller.enqueue(encoder.encode(`data: ${errorData}\n\n`));
+            controller.close();
           }
+        },
+      });
 
-          controller.enqueue(encoder.encode(`data: {"done": true}\n\n`));
-          controller.close();
-        } catch (error) {
-          console.error('API Route: Streaming error:', error);
-          const errorData = JSON.stringify({
-            error: 'Streaming failed',
-            details: error instanceof Error ? error.message : 'Unknown error'
-          });
-          controller.enqueue(encoder.encode(`data: ${errorData}\n\n`));
-          controller.close();
+      return new Response(readable, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
+    } catch (modelError) {
+      console.error('API Route: Model initialization error:', modelError);
+      
+      let errorMessage = 'Failed to initialize AI service';
+      if (modelError instanceof Error) {
+        if (modelError.message.includes('API_KEY')) {
+          errorMessage = 'Failed to authenticate with AI service';
+        } else if (modelError.message.includes('network') || modelError.message.includes('fetch')) {
+          errorMessage = 'Network error connecting to AI service';
+        } else {
+          errorMessage = modelError.message;
         }
-      },
-    });
-
-    return new Response(readable, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      },
-    });
+      }
+      
+      return c.json({ error: errorMessage }, 500);
+    }
 
   } catch (error) {
-    console.error('API Route: Setup error:', error);
-    return c.json(
-      { error: 'Failed to setup streaming', details: error instanceof Error ? error.message : 'Unknown error' },
-      500
-    );
+    console.error('API Route: Request parsing error:', error);
+    
+    let errorMessage = 'Invalid request format';
+    if (error instanceof Error) {
+      errorMessage = error.message;
+    }
+    
+    return c.json({ error: errorMessage }, 400);
   }
 });
 
